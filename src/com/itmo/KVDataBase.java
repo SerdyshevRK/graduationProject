@@ -8,13 +8,11 @@ import java.util.Map;
 
 public class KVDataBase {
     // списки объектов для обработки (сохранение)
-    Map<Integer, Object> itemsToAdd;
+    Map<Integer, Object> objectsToAdd;
 
     public KVDataBase() {
-        itemsToAdd = new HashMap<>();
+        objectsToAdd = new HashMap<>();
     }
-
-    // помещаем объект в коллекцию, которая в последствии будет записана на диск
 
     /**
      * помещаем объекты, которые нужно сохранить на дске в коллекцию,
@@ -24,7 +22,20 @@ public class KVDataBase {
      */
     public void add(int key, Object object) {
         if (object != null)
-            itemsToAdd.put(key, object);
+            objectsToAdd.put(key, object);
+    }
+
+    public void update(int key, Object object) {
+        String fileName = object.getClass().getSimpleName() + ".kvdb";    // file with object fields
+        String idxFileName = fileName.substring(0, fileName.length() - 5) + "_idx.kvdb";    // file with object key and offset
+        try {
+            long offset = getOffset(key, idxFileName);
+            // todo: mark fields as 'deleted'
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+        add(key,object);
     }
 
     /**
@@ -39,13 +50,13 @@ public class KVDataBase {
         String idxFileName = type.getSimpleName() + "_idx.kvdb";
         T retObj = null;
 
-        try (DataInputStream in = new DataInputStream(new FileInputStream(fileName))) {
+        try (RandomAccessFile in = new RandomAccessFile(fileName, "r")) {
             retObj = type.newInstance();
             long offset = getOffset(key, idxFileName);
             if (offset == -1)       // если файл существует, но пустой.
                 return null;
 
-            in.skip(offset);
+            in.seek(offset);
             if (key != in.readInt())        // если по смещению лежит другой ключ и другие поля
                 return null;
             Field[] fields = type.getDeclaredFields();
@@ -70,7 +81,7 @@ public class KVDataBase {
      * @return - возвращаем значение поля из файла или null
      * @throws IOException
      */
-    private <T> T readFieldFromFile(Class<T> type, DataInputStream in) throws IOException {
+    private <T> T readFieldFromFile(Class<T> type, RandomAccessFile in) throws IOException {
         Object retVal = null;
         switch (type.toString()) {
             case "boolean":
@@ -115,11 +126,16 @@ public class KVDataBase {
             throw new FileNotFoundException();
         }
 
-        try (DataInputStream in = new DataInputStream(new FileInputStream(file))) {
-            while (file.canRead()) {
-                keyFromFile = in.readInt();
+        try (RandomAccessFile in = new RandomAccessFile(file, "r")) {
+            while (true) {
+                try {
+                    keyFromFile = in.readInt();
+                } catch (EOFException e) {
+                    break;
+                }
+
                 if (keyFromFile != key) {
-                    in.skip(8);         // пропускаем не нужное нам смещение
+                    in.skipBytes(Long.BYTES);         // пропускаем не нужное нам смещение
                     continue;
                 }
                 offset = in.readLong();     // читаем смещение
@@ -156,7 +172,7 @@ public class KVDataBase {
      */
     private void writeObjectsToFile() throws IOException, IllegalAccessException {
         String fileName;
-        for (Map.Entry<Integer, Object> entry : itemsToAdd.entrySet()) {
+        for (Map.Entry<Integer, Object> entry : objectsToAdd.entrySet()) {
             Class objClass = entry.getValue().getClass();
             fileName = objClass.getSimpleName() + ".kvdb";
             Field[] objFields = objClass.getDeclaredFields();
@@ -172,7 +188,7 @@ public class KVDataBase {
                 writeFieldToFile(field.getType(), field.get(entry.getValue()), fileName);
             }
         }
-        itemsToAdd.clear();
+        objectsToAdd.clear();
     }
 
     /**
@@ -184,7 +200,7 @@ public class KVDataBase {
      */
     private void writeKeyToFile(int key, String fileName) throws IOException {
         String indexFileName = fileName.substring(0, fileName.length() - 5) + "_idx.kvdb";         // имя файла для хранения пар: 'ключ-смещение'
-        DataOutputStream out = null;
+        RandomAccessFile out = null;
         File file = new File(fileName);
         long offset = 0;
 
@@ -194,7 +210,8 @@ public class KVDataBase {
 
         try {
             // сохранение ключа в основном файле
-            out = new DataOutputStream(new FileOutputStream(fileName, true));
+            out = new RandomAccessFile(fileName, "rw");
+            out.seek(out.length());
             out.writeInt(key);
         } finally {
             out.close();
@@ -202,12 +219,58 @@ public class KVDataBase {
 
         try {
             // сохранение смещения и ключа
-            out = new DataOutputStream(new FileOutputStream(indexFileName, true));
-            out.writeInt(key);
-            out.writeLong(offset);
+            out = new RandomAccessFile(indexFileName, "rw");
+            int keyOffset = getKeyOffset(key, indexFileName);
+            if (keyOffset < 0) {
+                out.seek(out.length());
+                out.writeInt(key);
+                out.writeLong(offset);
+            } else {
+                out.seek(keyOffset);
+                out.writeInt(key);
+                out.writeLong(offset);
+            }
         } finally {
             out.close();
         }
+    }
+
+    /**
+     * проверяем существует ли заданный ключ в файле и, если существует возвращаем его смещение
+     * @param key - значение ключа, которое нужно проверить
+     * @param idxFileName - имя файла, в котором проверяется наличие ключа
+     * @return - возвращаемое значение равно смещению ключа в файле или '-1',
+     *          если этого ключа в файле нет, или файл не существует.
+     * @throws IOException
+     */
+
+    private int getKeyOffset(int key, String idxFileName) throws IOException {
+        File file = new File(idxFileName);
+        int keyFromFile;
+        int offset = -1;
+        int currentPosition = 0;
+
+        if (!file.exists() || !file.isFile())
+            return offset;
+
+        try (RandomAccessFile in = new RandomAccessFile(file, "r")) {
+            while (true) {
+                try {
+                    keyFromFile = in.readInt();
+                } catch (EOFException e) {
+                    break;
+                }
+
+                if (keyFromFile != key) {
+                    currentPosition += Integer.BYTES;
+                    currentPosition += in.skipBytes(Long.BYTES);
+                } else {
+                    offset = currentPosition;
+                    break;
+                }
+            }
+        }
+        return offset;
     }
 
     /**
@@ -219,7 +282,8 @@ public class KVDataBase {
      * @throws IOException
      */
     private void writeFieldToFile(Class type, Object data, String fileName) throws IOException {
-        try(DataOutputStream out = new DataOutputStream(new FileOutputStream(fileName, true))) {
+        try(RandomAccessFile out = new RandomAccessFile(fileName, "rw")) {
+            out.seek(out.length());
             switch (type.toString()) {
                 case "boolean":
                     out.writeBoolean((boolean) data);
