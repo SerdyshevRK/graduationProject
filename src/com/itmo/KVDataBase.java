@@ -3,377 +3,175 @@ package com.itmo;
 import java.io.*;
 import java.lang.annotation.Annotation;
 import java.lang.reflect.Field;
+import java.nio.file.DirectoryStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.TreeMap;
 
 public class KVDataBase {
-    private File filesDirectory;    // директория для хранения фалов базы
-    private Map<Integer, Object> objectsToAdd;  // список добавленных в базу объектов
-    private Map<String, TreeMap<Integer, Long>> primaryKeyMap;  // ключи и смещения сохраненных в базе объектов
-    private Map<String, RandomAccessFile> openFiles;    // файлы необходимые базе для работы с данными
+    private String mainDirectory;
+    private final String extension = ".kvdb";
+    private HashMap<Path, HashMap<Integer, Long>> keys;
+    private HashMap<Path, Boolean> rewriteStatus;
 
     private KVDataBase() {
-        objectsToAdd = new HashMap<>();
-        openFiles = new TreeMap<>();
-        primaryKeyMap = new TreeMap<>();
+        keys = new HashMap<>();
+        rewriteStatus = new HashMap<>();
     }
 
     /**
-     * создаем объект нашей базы, устанавливаем путь к директории, в которой будут храниться или уже храняться данные
-     * при начале работы с базой просматриваем директорию,
-     * если такой директории не существует (база создается первый раз) создаем ее.
-     * если в директории базы находятся файлы, открываем их все на чтение/запись
-     * @param directoryPath путь к директории с файлами базы данных
-     * @return возвращает созданный объек БД
+     * создает объект KVDataBase, передает ему путь к директории, где лежат файлы с данными (указывается пользователем).
+     * если такой директории не существует, создает ее
+     * читает key-файлы в память, если они присутствуют в директории
+     * @param directoryPath путь к директории с файлами
+     * @return возвращает новый обект KVDataBase
      */
     public static KVDataBase open(String directoryPath) {
-        KVDataBase base = new KVDataBase();
+        KVDataBase dataBase = new KVDataBase();
+        dataBase.mainDirectory = directoryPath;
 
-        // create directory for all files needed for data base
-        base.filesDirectory = new File(directoryPath);
-        if (!base.filesDirectory.exists()) {
-            base.filesDirectory.mkdir();
+        File directory = new File(dataBase.mainDirectory);
+        if (!directory.exists())
+            directory.mkdir();
+
+        dataBase.readKeyFiles();
+
+        System.out.println("LOG: " + dataBase.keys.toString());
+
+        return dataBase;
+    }
+
+    /**
+     * просматривает имена файлов и сохраняет их в мапу со статусом перезаписи (true/false)
+     * читает данные из файлов с ключами, сохраняет их в мапу 'путь - мапа ключей'
+     */
+    private void readKeyFiles() {
+        HashMap<Integer, Long> keyOffsetMap;
+
+        try (DirectoryStream<Path> directory = Files.newDirectoryStream(Paths.get(mainDirectory))) {
+            for (Path file : directory) {
+                rewriteStatus.put(file, false);
+                if (file.getFileName().toString().contains("Keys")) {
+                    keyOffsetMap = readKeysAndOffsetsFromFile(file);
+                    keys.put(file, keyOffsetMap);
+                }
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
         }
+        System.out.println("LOG: фалы с ключами прочитаны.");
+    }
 
-        try {
-            base.openAllFilesToRW(base.filesDirectory);
-            base.loadKeysToMemory();
+    /**
+     * читает значения ключей и смещений из файла
+     * @param filePath путь к файлу из которого читаются значения
+     * @return возвращает мапу 'ключ-смещение' или null, если в файле не было записей
+     */
+    private HashMap<Integer, Long> readKeysAndOffsetsFromFile(Path filePath) {
+        HashMap<Integer, Long> keyOffsetMap = new HashMap<>();
+        int key;
+        long offset;
+
+        try(RandomAccessFile raf = new RandomAccessFile(filePath.toFile(), "rw")) {
+            while (true) {
+                try {
+                    key = raf.readInt();
+                    offset = raf.readLong();
+                    keyOffsetMap.put(key, offset);
+                } catch (EOFException e) {
+                    break;
+                }
+            }
         } catch (IOException e) {
             e.printStackTrace();
         }
 
-        return base;
-    }
-
-    private void loadKeysToMemory() throws IOException {
-        RandomAccessFile in;
-        TreeMap<Integer, Long> keyMap;
-
-        for (String fileName : openFiles.keySet()) {
-            if (fileName.contains("idx")) {
-                in = openFiles.get(fileName);
-                keyMap = new TreeMap<>();
-                while (true) {
-                    try {
-                        keyMap.put(in.readInt(), in.readLong());
-                        primaryKeyMap.put(fileName, keyMap);
-                    } catch (EOFException e) {
-                        break;
-                    }
-                }
-            }
-        }
+        System.out.println("LOG: файл с ключами и смещениями прочитан.");
+        return keyOffsetMap;
     }
 
     /**
-     * закрывает все файлы, которые были открыты при начале работы с базой
-     */
-    public void close() {
-        for (Map.Entry<String, RandomAccessFile> entry : openFiles.entrySet()) {
-            try {
-                entry.getValue().close();
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
-        }
-    }
-
-    private void openAllFilesToRW(File filesDirectory) throws IOException {
-        File[] files = filesDirectory.listFiles();
-        if (files == null || files.length == 0)
-            return;
-
-        RandomAccessFile raf;
-        for (File file : files) {
-            raf = new RandomAccessFile(file, "rw");
-            openFiles.put(file.toString(), raf);
-        }
-    }
-
-    /**
-     * помещаем объекты, которые нужно сохранить на дске в коллекцию,
-     * которая в последующем будет обрабатываться
-     * @param key задает ключ, который будет использоваться для поиска объекта в базе
-     * @param object объект, который нам нужно сохранить
+     * добавляет объект в базу данных: сохраняет значение его полей в файл
+     * сохраняет его смещение по ключу в файле с ключами
+     * @param key ключ для дальнейшего поиска объекта
+     * @param object объект, который надо добавить в базу данных
      */
     public void add(int key, Object object) {
-        // todo: check if object with this key already exists in base
-        if (object != null)
-            objectsToAdd.put(key, object);
+        long offset;
+        Class<?> clazz = object.getClass();
+        Field[] fields = clazz.getDeclaredFields();
+        Path filePath = Paths.get(mainDirectory + "/" + clazz.getSimpleName() + extension);
+        Path keyFilePath = Paths.get(mainDirectory + "/" + clazz.getSimpleName() + "Keys" + extension);
+
+        offset = writeFieldsToFile(fields, object, filePath);
+        writeKeyToFile(key, offset, keyFilePath);
+    }
+
+    private void add(int key, Object object, String filePath) {
+        long offset;
+        Class<?> clazz = object.getClass();
+        Field[] fields = clazz.getDeclaredFields();
+        Path keyFilePath = Paths.get(mainDirectory + "/" + clazz.getSimpleName() + "Keys" + extension);
+
+        offset = writeFieldsToFile(fields, object, Paths.get(filePath));
+        writeKeyToFile(key, offset, keyFilePath);
     }
 
     /**
-     * помечаем объекты, которые надо удалить из базы
-     * @param key ключ объекта
-     * @param objectType тип удаляемого объекта, определяет в каком файле будет помечаться объект
+     * сохраняет значения ключа и смещения в памяти
+     * записывает ключ и смещение в файле с полями объекта по этому ключу, с которого началась запись этих полей
+     * @param key значение ключа
+     * @param offset смещение в файле, с которого были записаны поля
+     * @param keyFilePath путь к файлу, в котором будут храниться значения ключа и смещения
      */
-    public void remove(int key, Class<?> objectType) {
-        String fileName = filesDirectory + "\\" + objectType.getSimpleName() + "kvdb";
-        try {
-            setDeletedMarker(key, fileName, true);
+    private void writeKeyToFile(int key, long offset, Path keyFilePath) {
+        writeKeyToMemory(key, offset, keyFilePath);
+
+        try (RandomAccessFile writer = new RandomAccessFile(keyFilePath.toFile(), "rw")) {
+            writer.seek(writer.length());
+            writer.writeInt(key);
+            writer.writeLong(offset);
         } catch (IOException e) {
             e.printStackTrace();
         }
     }
 
-    private void deleteObjectsFromFile() {
-        // todo: delete keys from idx file
-        // todo: delete objects from file ¯\_(ツ)_/¯
-    }
-
-    public void update(int key, Object object) {
-        String fileName = filesDirectory + "\\" + object.getClass().getSimpleName() + ".kvdb";    // file with object fields
-        try {
-            setDeletedMarker(key, fileName, true);
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-        add(key,object);
+    /**
+     * сохраняет значения ключа и смещения в файле с полями в мапу keys,
+     * которая хранит имя файла, в котором находятся значения, в качестве ключа для получения этих значений
+     * @param key ключ, который сохраняется в файл
+     * @param offset смещение по этому ключу
+     * @param keyFilePath имя файла, в котором будут храниться значения ключа и смещения
+     */
+    private void writeKeyToMemory(int key, long offset, Path keyFilePath) {
+        HashMap<Integer, Long> keyOffsetMap = new HashMap<>();
+        keyOffsetMap.put(key,offset);
+        keys.put(keyFilePath, keyOffsetMap);
     }
 
     /**
-     * поиск объекта в базе данных по ключу
-     * @param key задает ключ, по которому будем искать объект
-     * @param type тип объекта, который хочет получить пользователь,
-     *             позволяет определить в каком файле нужно искать поля для объекта
-     * @return возвращает искомый объект или null, если объект не был создан
+     * считает смещение в файле, с которого начнется запись полей объекта
+     * просматривает поля объекта и, если поле не помечено аннотацией @Exclude, сохраняет его в файл
+     * @param fields список полей объекта, которые надо сохранить
+     * @param object объект, поля которого сохраняются
+     * @param filePath путь к файлу, в который будут записаны поля
+     * @return возвращает смещение в файле, с которого началась запись
      */
-    public <T> T get(int key, Class<T> type) {
-        String fileName = filesDirectory + "\\" +  type.getSimpleName() + ".kvdb";     // имя файла из которого читаем поля объекта
-        String idxFileName = fileName.substring(0, fileName.length() - 5) + "_idx.kvdb";
-        T retObj = null;
+    private long writeFieldsToFile(Field[] fields, Object object, Path filePath) {
+        File file = new File(filePath.toString());
+        long offset = file.length();
 
-        try {
-            RandomAccessFile raf = openFiles.get(fileName);
-            if (raf == null)
-                return null;
-
-            retObj = type.newInstance();
-            long offset = getOffset(key, idxFileName);
-            if (offset == -1)   // если файл существует, но пустой.
-                return null;
-
-            raf.seek(offset);
-            if (key != raf.readInt())    // если по смещению лежит другой ключ и другие поля
-                return null;
-            raf.skipBytes(Byte.BYTES);   // пропускаем флаг удаления
-            Field[] fields = type.getDeclaredFields();
-            Object value;
-            for (Field field : fields) {
-                field.setAccessible(true);
-                value = readFieldFromFile(field.getType(), raf);
-                field.set(retObj, value);
-            }
-        } catch (IOException | IllegalAccessException | InstantiationException e) {
-            e.printStackTrace();
-        }
-
-        return type.cast(retObj);     // приведение типов
-    }
-
-    /**
-     * читаем поле из файла и возвращаем его значение пользователю,
-     * метод для чтения и возвращаемое значение зависит от типа поля
-     * @param type тип поля, которое надо прочитать
-     * @param raf InputStream, из которого читаем значения
-     * @param <T> тип который надо вернуть, задается типом поля, которое читаем
-     * @return возвращаем значение поля из файла или null
-     * @throws IOException
-     */
-    private <T> T readFieldFromFile(Class<T> type, RandomAccessFile raf) throws IOException {
-        Object retVal = null;
-        switch (type.toString()) {
-            case "boolean":
-                retVal = raf.readBoolean();
-                break;
-            case "int":
-                retVal = raf.readInt();
-                break;
-            case "long":
-                retVal = raf.readLong();
-                break;
-            case "float":
-                retVal = raf.readFloat();
-                break;
-            case "double":
-                retVal = raf.readDouble();
-                break;
-            case "class java.lang.String":
-                int len = raf.readInt();
-                byte[] buffer = new byte[len];
-                raf.read(buffer);
-                retVal = new String(buffer);
-                break;
-        }
-        return (T) retVal;
-    }
-
-    /**
-     * поиск смещения для чтения объекта в основном файле по заданному ключу
-     * @param key ключ объекта, смещение которого мы ищем
-     * @param idxFileName файл, в котором надо искать ключ объекта и его смещение
-     * @return возвращает смещение в основном файле, с которого начинаются поля объекта,
-     * или -1, если файл с индексами пуст (не содержит ни одной записи о ключах)
-     */
-    private long getOffset(int key, String idxFileName) {
-        Map<Integer, Long> map;
-        map = primaryKeyMap.get(idxFileName);
-
-        return map.get(key) == null ? -1 : map.get(key);
-    }
-
-    /* функция записи объектов в файл, обновления данных*/
-    public void save() {
-        try {
-            writeObjectsToFile();
-        } catch (IOException | IllegalAccessException e) {
-            e.printStackTrace();
-        }
-    }
-
-    /**
-     * сохранение всех объектов на диск (в БД), записанных в коллекцию 'для сохранения'.
-     * считываем имя класса сохраняемого объекта, создаем файл с таким же названием,
-     * записываем ключ, назначенный пользователем для этого объекта, в файл,
-     * просматриваем все поля в объекте и пишем их в файл после ключа
-     * @throws IOException
-     * @throws IllegalAccessException
-     */
-    private void writeObjectsToFile() throws IOException, IllegalAccessException {
-        String fileName;
-        for (Map.Entry<Integer, Object> entry : objectsToAdd.entrySet()) {
-            Class objClass = entry.getValue().getClass();
-            fileName = filesDirectory + "\\" +  objClass.getSimpleName() + ".kvdb";
-            Field[] objFields = objClass.getDeclaredFields();
-
-            writeKeyToFile(entry.getKey(), fileName);
-            setDeletedMarker(entry.getKey(), fileName, false);
-
-            for (Field field : objFields) {
-                Annotation annotation = field.getAnnotation(Exclude.class);
-                if (annotation != null) {
-                    continue;
-                }
-                field.setAccessible(true);
-                writeFieldToFile(field.getType(), field.get(entry.getValue()), fileName);
-            }
-        }
-        objectsToAdd.clear();
-    }
-
-    /**
-     * поднимает флаг, который сообщает о том, что объект (поля объекта) должны быть удалены из файла
-     * @param key ключ объекта который помечается как удаленный
-     * @param fileName имя файла, в котором записаны поля объекта
-     * @param isDeleted определяет нужно ли удалить этот объект или нет
-     * @throws IOException
-     */
-    private void setDeletedMarker(int key, String fileName, boolean isDeleted) throws IOException {
-        String idxFileName = fileName.substring(0, fileName.length() - 5) + "_idx.kvdb";
-        long offset = getOffset(key, idxFileName);
-        RandomAccessFile raf = openFiles.get(fileName);
-        raf.seek(offset);
-        raf.skipBytes(Integer.BYTES);   // пропускаем ключ
-        raf.writeBoolean(isDeleted);
-    }
-
-    /**
-     * при записи ключа в основной файл, сохраняем смещение, с которого началась запись,
-     * и сохраняем его в отдельный файл вместе с ключом для облегчения (ускорения) поиска объекта
-     * @param key ключ объекта, заданный пользователем
-     * @param fileName имя основного файла, в который сохраняются ключ и поля объекта
-     * @throws IOException
-     */
-    private void writeKeyToFile(int key, String fileName) throws IOException {
-        String idxFileName = fileName.substring(0, fileName.length() - 5) + "_idx.kvdb";  // имя файла для хранения пар: 'ключ-смещение'
-        RandomAccessFile raf;
-        long offset = 0;
-
-        // сохранение ключа в основном файле
-        raf = openFiles.get(fileName);
-        if (raf == null) {
-            raf = new RandomAccessFile(fileName, "rw");
-            openFiles.put(fileName, raf);
-        }
-
-        if (raf != null)
-            offset = raf.length();
-
-        raf.seek(raf.length());
-        raf.writeInt(key);
-
-        // сохранение смещения и ключа
-        raf = openFiles.get(idxFileName);
-        if (raf == null) {
-            raf = new RandomAccessFile(idxFileName, "rw");
-            openFiles.put(idxFileName, raf);
-        }
-
-        int keyOffset = getKeyOffset(key, idxFileName);
-        if (keyOffset < 0) {
-            raf.seek(raf.length());
-            raf.writeInt(key);
-            raf.writeLong(offset);
-        } else {
-            raf.seek(keyOffset);
-            raf.writeInt(key);
-            raf.writeLong(offset);
-        }
-
-        addKeyToMemory(key, offset, idxFileName);
-    }
-
-    /**
-     * добавляет новый ключ с его смещением, либо обновляет уже имеющееся значение в памяти
-     * @param key ключ, который надо добавить или обновить
-     * @param offset значение смещения этого ключа
-     * @param idxFileName файл, в который он будет записан
-     */
-    private void addKeyToMemory(int key, long offset, String idxFileName) {
-        TreeMap<Integer, Long> map = primaryKeyMap.get(idxFileName);
-        if (map == null) {
-            map = new TreeMap<>();
-            map.put(key, offset);
-            primaryKeyMap.put(idxFileName, map);
-            return;
-        }
-
-        map.put(key, offset);
-    }
-
-    /**
-     * проверяем существует ли заданный ключ в файле и, если существует возвращаем его смещение
-     * @param key значение ключа, которое нужно проверить
-     * @param idxFileName имя файла, в котором проверяется наличие ключа
-     * @return возвращаемое значение равно смещению ключа в файле или '-1',
-     *          если этого ключа в файле нет, или файл не существует.
-     * @throws IOException
-     */
-
-    private int getKeyOffset(int key, String idxFileName) throws IOException {
-        int keyFromFile;
-        int offset = -1;
-        int currentPosition = 0;
-
-        RandomAccessFile raf = openFiles.get(idxFileName);
-        if (raf == null) {
-            return offset;
-        }
-
-        while (true) {
+        for (Field field : fields) {
+            field.setAccessible(true);
+            Annotation annotation = field.getAnnotation(Exclude.class);
+            if (annotation != null)
+                continue;
             try {
-                keyFromFile = raf.readInt();
-            } catch (EOFException e) {
-                break;
-            }
-
-            if (keyFromFile != key) {
-                currentPosition += Integer.BYTES;
-                currentPosition += raf.skipBytes(Long.BYTES);
-            } else {
-                offset = currentPosition;
-                break;
+                writeOneFieldToFile(field.getType(), field.get(object), filePath);
+            } catch (IllegalAccessException e) {
+                e.printStackTrace();
             }
         }
 
@@ -381,38 +179,213 @@ public class KVDataBase {
     }
 
     /**
-     * запись конкретного поля объекта в основной файл
-     * в зависимости от типа поля вызываются разные методы для записи
+     * сохраняет значение поля в файл
      * @param type тип записываемого поля
-     * @param data данные, которые хранятся в этом поле (значение поля: field = value)
-     * @param fileName имя основного файла, в которой это поле будет записано
-     * @throws IOException
+     * @param fieldValue значение записываемого поля
+     * @param filePath путь к файлу, в который производится запись
      */
-    private void writeFieldToFile(Class type, Object data, String fileName) throws IOException {
-        RandomAccessFile raf = openFiles.get(fileName);
+    private void writeOneFieldToFile(Class<?> type, Object fieldValue, Path filePath) {
+        try (RandomAccessFile writer = new RandomAccessFile(filePath.toFile(), "rw")) {
+            writer.seek(writer.length());
 
-        raf.seek(raf.length());
-        switch (type.toString()) {
-            case "boolean":
-                raf.writeBoolean((boolean) data);
-                break;
-            case "int":
-                raf.writeInt((int) data);
-                break;
-            case "long":
-                raf.writeLong((long) data);
-                break;
-            case "float":
-                raf.writeFloat((float) data);
-                break;
-            case "double":
-                raf.writeDouble((double) data);
-                break;
-            case "class java.lang.String":
-                byte[] buffer = ((String) data).getBytes();
-                raf.writeInt(buffer.length);
-                raf.write(buffer);
-                break;
+            switch (type.toString()) {
+                case "boolean":
+                    writer.writeBoolean((boolean) fieldValue);
+                    break;
+                case "int":
+                    writer.writeInt((int) fieldValue);
+                    break;
+                case "long":
+                    writer.writeLong((long) fieldValue);
+                    break;
+                case "float":
+                    writer.writeFloat((float) fieldValue);
+                    break;
+                case "double":
+                    writer.writeDouble((double) fieldValue);
+                    break;
+                case "class java.lang.String":
+                    byte[] buffer = ((String) fieldValue).getBytes();
+                    writer.writeInt(buffer.length);
+                    writer.write(buffer);
+                    break;
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
         }
+    }
+
+    /**
+     * читает поля объекта из файла, строит объект нужного типа 'Т' и возвращает его пользователю
+     * @param key ключ объекта, по которому производится поиск значений полей объекта в файле
+     * @param type тип объекта, который нужно вернуть
+     * @param <T>
+     * @return возвращает объект типа 'T' с заполненныйми полями или null, если нет объекта с таким ключем
+     */
+    public <T> T get(int key, Class<T> type) {
+        Object object = null;
+        Path filePath = Paths.get(mainDirectory + "/" + type.getSimpleName() + extension);
+        Path keyFilePath = Paths.get(mainDirectory + "/" + type.getSimpleName() + "Keys" + extension);
+
+        long offset = getOffset(key, keyFilePath);
+        if (offset < 0)
+            return null;
+
+        Field[] fields = type.getDeclaredFields();
+        try {
+            object = type.newInstance();
+            readAllFieldsFromFile(fields, object, filePath, offset);
+        } catch (InstantiationException e) {
+            e.printStackTrace();
+        } catch (IllegalAccessException e) {
+            e.printStackTrace();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+        return (T) object;
+    }
+
+    /**
+     * находит смещение в мапе по ключу
+     * @param key ключ для которого надо найти смещение
+     * @param keyFilePath файл, в котором записаны данные (используется как ключ для мапы)
+     * @return возвращает значение смещения для заланного ключа или -1, если такого ключа нет в мапе
+     */
+    private long getOffset(int key, Path keyFilePath) {
+        HashMap<Integer, Long> keyOffsetMap = keys.get(keyFilePath);
+        Long offset = keyOffsetMap.get(key);
+
+        return offset == null ? -1 : offset.longValue();
+    }
+
+    private void readAllFieldsFromFile(Field[] fields, Object object, Path filePath, long offset) throws IOException, IllegalAccessException {
+        try (RandomAccessFile reader = new RandomAccessFile(filePath.toFile(), "rw")) {
+            reader.seek(offset);
+            for (Field field : fields) {
+                field.setAccessible(true);
+                Annotation annotation = field.getAnnotation(Exclude.class);
+                if (annotation != null)
+                    continue;
+                field.set(object, readOneFieldFromFile(field.getType(), reader));
+            }
+        }
+    }
+
+    /**
+     * читает значение поля из файла
+     * @param type тип поля, для которого читается значение
+     * @param reader объект типа RandomAccessFile для чтения полей из файла
+     * @param <T> определяет какого типа данные нужно вернуть пользователю
+     * @return возвращает значение поля приведенного к нужному типу 'T'
+     */
+    private <T> T readOneFieldFromFile(Class<T> type, RandomAccessFile reader) {
+        Object fieldValue = null;
+        try {
+            switch (type.toString()) {
+                case "boolean":
+                    fieldValue = reader.readBoolean();
+                    break;
+                case "int":
+                    fieldValue = reader.readInt();
+                    break;
+                case "long":
+                    fieldValue = reader.readLong();
+                    break;
+                case "float":
+                    fieldValue = reader.readFloat();
+                    break;
+                case "double":
+                    fieldValue = reader.readDouble();
+                    break;
+                case "class java.lang.String":
+                    int length = reader.readInt();
+                    byte[] buffer = new byte[length];
+                    reader.read(buffer);
+                    fieldValue = new String(buffer);
+                    break;
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        return (T) fieldValue;
+    }
+
+    /**
+     * удаляет ключ со смещением из мапы, для того чтобы нельзя было прочитать значения полей с этим ключом
+     * помечает в каких файлах было произведено удаление, чтобы их можно было переписать
+     * @param key удаляемый ключ
+     * @param type тип удаляемого объекта (определяет в каком файле находятся поля этогго объекта)
+     */
+    public void remove(int key, Class<?> type) {
+        Path filePath = Paths.get(mainDirectory + "/" + type.getSimpleName() + extension);
+        Path keyFilePath = Paths.get(mainDirectory + "/" + type.getSimpleName() + "Keys" + extension);
+        removeKeyFromMemory(key, keyFilePath);
+
+        updateFilesToRewrite(filePath);
+    }
+
+    private void removeKeyFromMemory(int key, Path keyFilePath) {
+        HashMap<Integer, Long> keyOffsetMap = keys.get(keyFilePath);
+        keyOffsetMap.remove(key);
+    }
+
+    /**
+     * помечает какие файлы нужно переписать из-за внесенных в них изменений (remove/update)
+     * @param file файл который нужно пометить для перехаписи
+     */
+    private void updateFilesToRewrite(Path file) {
+        rewriteStatus.put(file, true);
+    }
+
+    public void update(int key, Object object) {
+        long offset;
+        Class<?> clazz = object.getClass();
+        Field[] fields = clazz.getDeclaredFields();
+        Path filePath = Paths.get(mainDirectory + "/" + clazz.getSimpleName() + extension);
+        Path keyFilePath = Paths.get(mainDirectory + "/" + clazz.getSimpleName() + "Keys" + extension);
+
+        offset = writeFieldsToFile(fields, object, filePath);
+        writeKeyToMemory(key, offset, keyFilePath);
+        updateFilesToRewrite(filePath);
+    }
+
+    /**
+     * переписывает каждый файл, который был помечен как измененный
+     */
+    public void rewriteFiles() {
+        for (Map.Entry<Path, Boolean> entry : rewriteStatus.entrySet()) {
+            if (entry.getValue()) {
+                try {
+                    rewriteOneFile(entry.getKey());
+                } catch (ClassNotFoundException e) {
+                    e.printStackTrace();
+                }
+            }
+        }
+    }
+
+    /**
+     * переписывает один из списка файлов: сначала читает поля из старого файла по ключу из памяти,
+     * затем записывает их в новый файл и обновляет ключ в памяти
+     * @param filePath
+     */
+    private void rewriteOneFile(Path filePath) throws ClassNotFoundException {
+        String fileName = filePath.getFileName().toString();
+        String tmpFile = mainDirectory + "/" + fileName.substring(0, fileName.length() - 5) + ".tmp";
+        // todo: can't resolve type from this fileName, required full class name
+        Class<?> type = Class.forName(fileName.substring(0, fileName.length() - 5));
+        Object object;
+
+        HashMap<Integer, Long> keyOffsetMap = keys.get(filePath);
+        new File(mainDirectory + "/" + type.getSimpleName() + "Keys" + extension).delete();
+
+        for (Integer key : keyOffsetMap.keySet()) {
+            object = get(key, type);
+            add(key, type.cast(object), tmpFile);
+        }
+
+        new File(filePath.toString()).delete();
+        new File(tmpFile).renameTo(filePath.toFile());
     }
 }
