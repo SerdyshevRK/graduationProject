@@ -15,10 +15,12 @@ public class KVDataBase {
     private final String extension = ".kvdb";
     private HashMap<Path, HashMap<Integer, Long>> keys;
     private HashMap<Path, Boolean> rewriteStatus;
+    private HashMap<String, String> savedTypes;
 
     private KVDataBase() {
         keys = new HashMap<>();
         rewriteStatus = new HashMap<>();
+        savedTypes = new HashMap<>();
     }
 
     /**
@@ -31,12 +33,12 @@ public class KVDataBase {
     public static KVDataBase open(String directoryPath) {
         KVDataBase dataBase = new KVDataBase();
         dataBase.mainDirectory = directoryPath;
-
         File directory = new File(dataBase.mainDirectory);
         if (!directory.exists())
             directory.mkdir();
 
         dataBase.readKeyFiles();
+        dataBase.readTypesFromFile();
 
         System.out.println("LOG: " + dataBase.keys.toString());
 
@@ -101,19 +103,70 @@ public class KVDataBase {
     public void add(int key, Object object) {
         long offset;
         Class<?> clazz = object.getClass();
+        saveNewType(clazz);
         Field[] fields = clazz.getDeclaredFields();
-        Path filePath = Paths.get(mainDirectory + "/" + clazz.getSimpleName() + extension);
-        Path keyFilePath = Paths.get(mainDirectory + "/" + clazz.getSimpleName() + "Keys" + extension);
+        Path filePath = Paths.get(mainDirectory + "\\" + clazz.getSimpleName() + extension);
+        Path keyFilePath = Paths.get(mainDirectory + "\\" + clazz.getSimpleName() + "Keys" + extension);
 
         offset = writeFieldsToFile(fields, object, filePath);
         writeKeyToFile(key, offset, keyFilePath);
+    }
+
+    private void saveNewType(Class<?> clazz) {
+        if (savedTypes.containsKey(clazz.getSimpleName()))
+            return;
+
+        savedTypes.put(clazz.getSimpleName(), clazz.getName());
+        File typesFile = new File(mainDirectory + "\\" + "Types" + extension);
+        try (RandomAccessFile writer = new RandomAccessFile(typesFile, "rw")) {
+            writer.seek(writer.length());
+            byte[] buffer;
+            for (String type : savedTypes.keySet()) {
+                buffer = type.getBytes();
+                writer.writeInt(buffer.length);
+                writer.write(buffer);
+                buffer = savedTypes.get(type).getBytes();
+                writer.writeInt(buffer.length);
+                writer.write(buffer);
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void readTypesFromFile() {
+        File typesFile = new File(mainDirectory + "\\" + "Types" + extension);
+        int length;
+        String type;
+        String clazz;
+        try (RandomAccessFile reader = new RandomAccessFile(typesFile, "rw")) {
+            reader.seek(0);
+            byte[] buffer;
+            while (true) {
+                try {
+                    length = reader.readInt();
+                    buffer = new byte[length];
+                    reader.read(buffer);
+                    type = new String(buffer);
+                    length = reader.readInt();
+                    buffer = new byte[length];
+                    reader.read(buffer);
+                    clazz = new String(buffer);
+                    savedTypes.put(type, clazz);
+                } catch (EOFException e) {
+                    break;
+                }
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
     }
 
     private void add(int key, Object object, String filePath) {
         long offset;
         Class<?> clazz = object.getClass();
         Field[] fields = clazz.getDeclaredFields();
-        Path keyFilePath = Paths.get(mainDirectory + "/" + clazz.getSimpleName() + "Keys" + extension);
+        Path keyFilePath = Paths.get(mainDirectory + "\\" + clazz.getSimpleName() + "Keys" + extension);
 
         offset = writeFieldsToFile(fields, object, Paths.get(filePath));
         writeKeyToFile(key, offset, keyFilePath);
@@ -146,9 +199,14 @@ public class KVDataBase {
      * @param keyFilePath имя файла, в котором будут храниться значения ключа и смещения
      */
     private void writeKeyToMemory(int key, long offset, Path keyFilePath) {
-        HashMap<Integer, Long> keyOffsetMap = new HashMap<>();
+        HashMap<Integer, Long> keyOffsetMap = keys.get(keyFilePath);
+        if (keyOffsetMap == null) {
+            keyOffsetMap = new HashMap<>();
+            keyOffsetMap.put(key, offset);
+            keys.put(keyFilePath, keyOffsetMap);
+            return;
+        }
         keyOffsetMap.put(key,offset);
-        keys.put(keyFilePath, keyOffsetMap);
     }
 
     /**
@@ -224,8 +282,8 @@ public class KVDataBase {
      */
     public <T> T get(int key, Class<T> type) {
         Object object = null;
-        Path filePath = Paths.get(mainDirectory + "/" + type.getSimpleName() + extension);
-        Path keyFilePath = Paths.get(mainDirectory + "/" + type.getSimpleName() + "Keys" + extension);
+        Path filePath = Paths.get(mainDirectory + "\\" + type.getSimpleName() + extension);
+        Path keyFilePath = Paths.get(mainDirectory + "\\" + type.getSimpleName() + "Keys" + extension);
 
         long offset = getOffset(key, keyFilePath);
         if (offset < 0)
@@ -318,8 +376,8 @@ public class KVDataBase {
      * @param type тип удаляемого объекта (определяет в каком файле находятся поля этогго объекта)
      */
     public void remove(int key, Class<?> type) {
-        Path filePath = Paths.get(mainDirectory + "/" + type.getSimpleName() + extension);
-        Path keyFilePath = Paths.get(mainDirectory + "/" + type.getSimpleName() + "Keys" + extension);
+        Path filePath = Paths.get(mainDirectory + "\\" + type.getSimpleName() + extension);
+        Path keyFilePath = Paths.get(mainDirectory + "\\" + type.getSimpleName() + "Keys" + extension);
         removeKeyFromMemory(key, keyFilePath);
 
         updateFilesToRewrite(filePath);
@@ -342,8 +400,8 @@ public class KVDataBase {
         long offset;
         Class<?> clazz = object.getClass();
         Field[] fields = clazz.getDeclaredFields();
-        Path filePath = Paths.get(mainDirectory + "/" + clazz.getSimpleName() + extension);
-        Path keyFilePath = Paths.get(mainDirectory + "/" + clazz.getSimpleName() + "Keys" + extension);
+        Path filePath = Paths.get(mainDirectory + "\\" + clazz.getSimpleName() + extension);
+        Path keyFilePath = Paths.get(mainDirectory + "\\" + clazz.getSimpleName() + "Keys" + extension);
 
         offset = writeFieldsToFile(fields, object, filePath);
         writeKeyToMemory(key, offset, keyFilePath);
@@ -372,13 +430,13 @@ public class KVDataBase {
      */
     private void rewriteOneFile(Path filePath) throws ClassNotFoundException {
         String fileName = filePath.getFileName().toString();
-        String tmpFile = mainDirectory + "/" + fileName.substring(0, fileName.length() - 5) + ".tmp";
-        // todo: can't resolve type from this fileName, required full class name
-        Class<?> type = Class.forName(fileName.substring(0, fileName.length() - 5));
+        String tmpFile = mainDirectory + "\\" + fileName.substring(0, fileName.length() - 5) + ".tmp";
+        Class<?> type = Class.forName(savedTypes.get(fileName.substring(0, fileName.length() - 5)));
         Object object;
 
-        HashMap<Integer, Long> keyOffsetMap = keys.get(filePath);
-        new File(mainDirectory + "/" + type.getSimpleName() + "Keys" + extension).delete();
+        Path keyFilePath = Paths.get(mainDirectory + "\\" + type.getSimpleName() + "Keys" + extension);
+        HashMap<Integer, Long> keyOffsetMap = keys.get(keyFilePath);
+        new File(keyFilePath.toString()).delete();
 
         for (Integer key : keyOffsetMap.keySet()) {
             object = get(key, type);
