@@ -1,18 +1,27 @@
 package com.itmo;
 
+import com.itmo.exceptions.EndOfFileException;
+
 import java.io.*;
 import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.file.*;
 import java.util.*;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Predicate;
 
 public class KVDataBase {
+    public static Map<String, KVDataBase> instances = new HashMap<>();
     private String mainDirectory;
     private final String extension = ".kvdb";
     private HashMap<Path, HashMap<Integer, Long>> keys;
     private HashMap<Path, Boolean> rewriteStatus;
     private HashMap<String, String> savedTypes;
     private HashMap<Path, RandomAccessFile> filesInDirectory;
+    private ReadWriteLock lock;
+    private Semaphore semaphore;
 
     private final Map<Class<?>, DbDescriptor> descriptors = new HashMap<>();
 
@@ -21,6 +30,8 @@ public class KVDataBase {
         rewriteStatus = new HashMap<>();
         savedTypes = new HashMap<>();
         filesInDirectory = new HashMap<>();
+        lock = new ReentrantReadWriteLock();
+        semaphore = new Semaphore(10);
     }
 
     /**
@@ -32,21 +43,26 @@ public class KVDataBase {
      * @return возвращает новый обект KVDataBase
      */
     public static KVDataBase open(String directoryPath) {
-        System.out.println("Database opening, please stand by...");
-        KVDataBase dataBase = new KVDataBase();
-        dataBase.mainDirectory = directoryPath;
-        File directory = new File(dataBase.mainDirectory);
-        if (!directory.exists())
-            directory.mkdir();
+        KVDataBase dataBase = KVDataBase.instances.get(directoryPath);
+        if (dataBase == null) {
+            System.out.println("Database opening, please stand by...");
+            dataBase = new KVDataBase();
+            dataBase.mainDirectory = directoryPath;
+            File directory = new File(dataBase.mainDirectory);
+            if (!directory.exists())
+                directory.mkdir();
 
-        try {
-            dataBase.openAllFiles();
-            dataBase.readKeyFiles();
-            dataBase.readTypesFromFile();
-        } catch (IOException | ClassNotFoundException e) {
-            throw new RuntimeException(e);
+            try {
+                dataBase.openAllFiles();
+                dataBase.readKeyFiles();
+                dataBase.readTypesFromFile();
+            } catch (IOException | ClassNotFoundException e) {
+                throw new RuntimeException(e);
+            }
+
+            System.out.println("Database ready.");
+            instances.put(directoryPath, dataBase);
         }
-
         return dataBase;
     }
 
@@ -60,14 +76,26 @@ public class KVDataBase {
         }
     }
 
-    public void close() {
+    public static void close(String directoryPath) {
+        KVDataBase db = instances.get(directoryPath);
+        if (db == null)
+            return;
+
         try {
-            for (RandomAccessFile file : filesInDirectory.values()) {
+            // закрыть все ридеры
+            for (DbDescriptor descriptor : db.descriptors.values()) {
+                for (int i = 0; i < descriptor.readers.length; i++) {
+                    descriptor.readers[i].getReader().close();
+                }
+            }
+
+            for (RandomAccessFile file : db.filesInDirectory.values()) {
                 file.close();
             }
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
+        instances.remove(db.mainDirectory);
     }
 
     /**
@@ -87,6 +115,7 @@ public class KVDataBase {
 
     /**
      * читает значения ключей и смещений из файла
+     *
      * @param reader читает значения из файла с ключами
      * @return возвращает мапу 'ключ - смещение'
      * @throws IOException
@@ -117,20 +146,35 @@ public class KVDataBase {
      * @param object объект, который надо добавить в базу данных
      */
     public void add(int key, Object object) {
-        long offset;
-        Class<?> clazz = object.getClass();
-
+        Class<?> type = object.getClass();
         try {
-            saveNewType(clazz);
-            DbDescriptor descriptor = getDbDescriptor(clazz);
-            offset = writeFieldsToFile(object, descriptor);
-            writeKeyToFile(key, offset, descriptor);
-
-        } catch (IOException | IllegalAccessException e) {
+            DbDescriptor descriptor = getDbDescriptor(type);
+            doUpdate(descriptor, key, object);
+            saveNewType(type);
+        } catch (IOException | IllegalAccessException | InterruptedException e) {
             throw new RuntimeException(e);
         }
     }
 
+    private void doUpdate(DbDescriptor descriptor, int key, Object object) throws IOException, IllegalAccessException, InterruptedException {
+        long offset;
+        try {
+            lock.writeLock().lock();
+            offset = writeFieldsToFile(object, descriptor);
+            writeKeyToFile(key, offset, descriptor);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * возвращает дескриптор класса объекта
+     * открывает файлы, нужные для сохранения или чтения данных для объектов данного класса
+     *
+     * @param clazz класс объекта, для которого нужно получить дескриптор
+     * @return
+     * @throws FileNotFoundException
+     */
     private DbDescriptor getDbDescriptor(Class<?> clazz) throws FileNotFoundException {
         if (!descriptors.containsKey(clazz)) {
             Field[] fields = clazz.getDeclaredFields();
@@ -153,7 +197,6 @@ public class KVDataBase {
             for (Field fld : fields) {
                 if (fld.getAnnotation(Exclude.class) == null) {
                     fld.setAccessible(true);
-
                     flds.add(fld);
                 }
             }
@@ -204,6 +247,7 @@ public class KVDataBase {
 
     /**
      * читает из файла в память список всех полных имен хранимых в базе типов объектов
+     * заполняет мапу дескриптеров классов
      */
     private void readTypesFromFile() throws IOException, ClassNotFoundException {
         File typesFile = new File(mainDirectory + "\\" + "Types" + extension);
@@ -236,33 +280,13 @@ public class KVDataBase {
     }
 
     /**
-     * служебный метод используется для перезаписи файлов после внесения в них изменений
-     *
-     * @param key      ключ объекта, который надо перезаписать
-     * @param object   объект, который надо перезаписать
-     * @param filePath имя временного файла в который будет записан объект (в дальнейшем переименовывается в рабочий файл)
-     */
-    private void add(int key, Object object, String filePath) {
-        long offset;
-        Class<?> clazz = object.getClass();
-
-        try {
-            DbDescriptor descriptor = getDbDescriptor(clazz);
-
-            offset = writeFieldsToFile(object, descriptor);
-            writeKeyToFile(key, offset, descriptor);
-        } catch (IllegalAccessException | IOException e) {
-            throw new RuntimeException(e);
-        }
-    }
-
-    /**
      * сохраняет значения ключа и смещения в памяти
      * записывает ключ и смещение в файле с полями объекта по этому ключу, с которого началась запись этих полей
-     * @param key значение ключа, которое надо сохранить в файл
-     * @param offset смещение по этому ключу
+     *
+     * @param key        значение ключа, которое надо сохранить в файл
+     * @param offset     смещение по этому ключу
      * @param descriptor дескриптор сохраняемого объекта, содержит пути к файлам с данными и ключами
-     *             и объекты для работы с этими файлами (запись/чтение)
+     *                   и объекты для работы с этими файлами (запись/чтение)
      * @throws IOException
      */
     private void writeKeyToFile(int key, long offset, DbDescriptor descriptor) throws IOException {
@@ -273,7 +297,7 @@ public class KVDataBase {
         byte[] offsetBytes = ByteBuffer.allocate(Long.BYTES).putLong(offset).array();
         System.arraycopy(keyBytes, 0, buffer, 0, keyBytes.length);
         System.arraycopy(offsetBytes, 0, buffer, keyBytes.length, offsetBytes.length);
-        RandomAccessFile writer = descriptor.keyFile;
+        RandomAccessFile writer = descriptor.keyFileWriter;
         writer.seek(writer.length());
         writer.write(buffer);
     }
@@ -287,28 +311,27 @@ public class KVDataBase {
      * @param keyFilePath имя файла, в котором будут храниться значения ключа и смещения
      */
     private void writeKeyToMemory(int key, long offset, Path keyFilePath) {
-        HashMap<Integer, Long> keyOffsetMap = keys.get(keyFilePath);
-        if (keyOffsetMap == null) {
-            keyOffsetMap = new HashMap<>();
-            keyOffsetMap.put(key, offset);
-            keys.put(keyFilePath, keyOffsetMap);
-            return;
+        Map<Integer, Long> map = keys.get(keyFilePath);
+        if (map == null) {
+            map = new HashMap<>();
         }
-        keyOffsetMap.put(key, offset);
+        map.put(key, offset);
     }
 
     /**
      * считает смещение в файле, с которого начнется запись полей объекта
      * просматривает поля объекта и, если поле не помечено аннотацией @Exclude, сохраняет его в файл
-     * @param object объект, который нужно сохранить в файл
+     *
+     * @param object     объект, который нужно сохранить в файл
      * @param descriptor дескриптор сохраняемого объекта, содержит пути к файлам с данными и ключами
-     *             и объекты для работы с этими файлами (запись/чтение)
+     *                   и объекты для работы с этими файлами (запись/чтение)
      * @return возвращает смещение, с которого началась запись в файл
      * @throws IllegalAccessException
      * @throws IOException
      */
     private long writeFieldsToFile(Object object, DbDescriptor descriptor) throws IllegalAccessException, IOException {
         File file = new File(descriptor.filePath.toString());
+        RandomAccessFile writer = descriptor.dbFileWriter;
         long offset = file.length();
 
         List<byte[]> fieldsInBytes = new ArrayList();
@@ -328,8 +351,7 @@ public class KVDataBase {
             position += field.length;
         }
 
-        RandomAccessFile writer = descriptor.dbFile;
-        writer.seek(writer.length());
+        writer.seek(offset);
         writer.write(buffer);
 
         return offset;
@@ -337,7 +359,8 @@ public class KVDataBase {
 
     /**
      * преобразует значение поля в массив байт
-     * @param type тип поля для преобразования
+     *
+     * @param type       тип поля для преобразования
      * @param fieldValue значение преобразуемого поля
      * @return возвращает массив байт полученный при преобразовании
      */
@@ -379,22 +402,24 @@ public class KVDataBase {
      * @param <T>
      * @return возвращает объект типа 'T' с заполненныйми полями или null, если нет объекта с таким ключем
      */
-    public <T> T get(int key, Class<T> type) {
-        Object object = null;
-
+    public <T> T getByKey(int key, Class<T> type) {
+        Object object;
         try {
+            semaphore.acquire();
+            lock.readLock().lock();
+
             DbDescriptor descriptor = getDbDescriptor(type);
 
             long offset = getOffset(key, descriptor.keyFilePath);
             if (offset < 0)
                 return null;
 
-            object = type.newInstance();
-            readAllFieldsFromFile(object, offset, descriptor);
-        } catch (InstantiationException | IllegalAccessException e) {
-            e.printStackTrace();
-        } catch (IOException e) {
+            object = readObjectByOffset(type, offset, descriptor);
+        } catch (InstantiationException | IllegalAccessException | InterruptedException | IOException e) {
             throw new RuntimeException(e);
+        } finally {
+            lock.readLock().unlock();
+            semaphore.release();
         }
 
         return (T) object;
@@ -406,13 +431,86 @@ public class KVDataBase {
      * @param <T>
      * @return
      */
-    public <T> T find() {
+
+    public <T> T findFirst(Class<T> type, Predicate<T> predicate) {
+        Object object = null;
+        DbDescriptor descriptor = null;
+        Reader reader = null;
         try {
-            throw new Exception();
-        } catch (Exception e) {
-            System.out.println("Not implemented method.");
+            semaphore.acquire();
+            lock.readLock().lock();
+
+            descriptor = getDbDescriptor(type);
+            reader = descriptor.getReader();
+            RandomAccessFile raf = reader.getReader();
+
+            for (Long offset : keys.get(descriptor.keyFilePath).values()) {
+                if (offset < 0)
+                    continue;
+                raf.seek(offset);
+                object = readObjectFromFile(type, raf, descriptor);
+                if (predicate.test((T) object))
+                    break;
+            }
+
+        } catch (IOException | IllegalAccessException | InstantiationException | InterruptedException e) {
+            throw new RuntimeException(e);
+        } finally {
+            if (descriptor != null)
+                descriptor.releaseReader(reader);
+            lock.readLock().unlock();
+            semaphore.release();
         }
-        return null;
+
+        return (T) object;
+    }
+
+    private <T> T readObjectFromFile(Class<T> type, RandomAccessFile reader, DbDescriptor descriptor) throws IllegalAccessException, InstantiationException, IOException {
+        Object object;
+        try {
+            object = type.newInstance();
+            for (Field field : descriptor.fields) {
+                field.set(object, readOneFieldFromFile(field.getType(), reader));
+            }
+        } catch (EndOfFileException e) {
+            return null;
+        }
+        return (T) object;
+    }
+
+    public <T> List<T> findAll(Class<T> type, Predicate<T> predicate) {
+        List<T> list = new ArrayList<>();
+        Object object;
+
+        DbDescriptor descriptor = null;
+        Reader reader = null;
+        try {
+            semaphore.acquire();
+            lock.readLock().lock();
+
+            descriptor = getDbDescriptor(type);
+            reader = descriptor.getReader();
+            RandomAccessFile raf = reader.getReader();
+
+            for (Long offset : keys.get(descriptor.keyFilePath).values()) {
+                if (offset < 0)
+                    continue;
+                raf.seek(offset);
+                object = readObjectFromFile(type, raf, descriptor);
+                if (predicate.test((T) object))
+                    list.add((T) object);
+            }
+
+        } catch (IOException | IllegalAccessException | InstantiationException | InterruptedException e) {
+            throw new RuntimeException(e);
+        } finally {
+            if (descriptor != null)
+                descriptor.releaseReader(reader);
+            lock.readLock().unlock();
+            semaphore.release();
+        }
+
+        return list;
     }
 
     /**
@@ -423,28 +521,33 @@ public class KVDataBase {
      * @return возвращает значение смещения для заланного ключа или -1, если такого ключа нет в мапе
      */
     private long getOffset(int key, Path keyFilePath) {
-        HashMap<Integer, Long> keyOffsetMap = keys.get(keyFilePath);
-        Long offset = keyOffsetMap.get(key);
-
-        return offset == null ? -1 : offset.longValue();
+        Long offset = keys.get(keyFilePath).get(key);
+        return offset == null ? -1 : offset;
     }
 
     /**
      * читает значения полей из файла и устанавливает их переданным полям объекта
-     * @param object объект, для которого читаются поля
-     * @param offset смещение в файле, с которого начинаются нужные данные
+     *
+     * @param type       тип объекта, который нужно прочитать и вернуть
+     * @param offset     смещение в файле, с которого начинаются нужные данные
      * @param descriptor дескриптор сохраняемого объекта, содержит пути к файлам с данными и ключами
-     *             и объекты для работы с этими файлами (запись/чтение)
+     *                   и объекты для работы с этими файлами (запись/чтение)
      * @throws IOException
      * @throws IllegalAccessException
      */
-    private void readAllFieldsFromFile(Object object, long offset, DbDescriptor descriptor) throws IOException, IllegalAccessException {
-        RandomAccessFile reader = descriptor.dbFile;
-        reader.seek(offset);
+    private <T> T readObjectByOffset(Class<T> type, long offset, DbDescriptor descriptor) throws IOException, IllegalAccessException, InstantiationException {
+        Object object = type.newInstance();
+        Reader reader = descriptor.getReader();
+        RandomAccessFile raf = reader.getReader();
+
+        raf.seek(offset);
 
         for (Field field : descriptor.fields) {
-            field.set(object, readOneFieldFromFile(field.getType(), reader));
+            field.set(object, readOneFieldFromFile(field.getType(), raf));
         }
+
+        descriptor.releaseReader(reader);
+        return (T) object;
     }
 
     /**
@@ -458,28 +561,32 @@ public class KVDataBase {
     private <T> T readOneFieldFromFile(Class<T> type, RandomAccessFile reader) throws IOException {
         Object fieldValue = null;
 
-        switch (type.toString()) {
-            case "boolean":
-                fieldValue = reader.readBoolean();
-                break;
-            case "int":
-                fieldValue = reader.readInt();
-                break;
-            case "long":
-                fieldValue = reader.readLong();
-                break;
-            case "float":
-                fieldValue = reader.readFloat();
-                break;
-            case "double":
-                fieldValue = reader.readDouble();
-                break;
-            case "class java.lang.String":
-                int length = reader.readInt();
-                byte[] buffer = new byte[length];
-                reader.read(buffer);
-                fieldValue = new String(buffer);
-                break;
+        try {
+            switch (type.toString()) {
+                case "boolean":
+                    fieldValue = reader.readBoolean();
+                    break;
+                case "int":
+                    fieldValue = reader.readInt();
+                    break;
+                case "long":
+                    fieldValue = reader.readLong();
+                    break;
+                case "float":
+                    fieldValue = reader.readFloat();
+                    break;
+                case "double":
+                    fieldValue = reader.readDouble();
+                    break;
+                case "class java.lang.String":
+                    int length = reader.readInt();
+                    byte[] buffer = new byte[length];
+                    reader.read(buffer);
+                    fieldValue = new String(buffer);
+                    break;
+            }
+        } catch (EOFException e) {
+            throw new EndOfFileException(e.getMessage());
         }
 
         return (T) fieldValue;
@@ -493,11 +600,15 @@ public class KVDataBase {
      * @param type тип удаляемого объекта (определяет в каком файле находятся поля этогго объекта)
      */
     public void remove(int key, Class<?> type) {
-        Path filePath = Paths.get(mainDirectory + "\\" + type.getSimpleName() + extension);
-        Path keyFilePath = Paths.get(mainDirectory + "\\" + type.getSimpleName() + "Keys" + extension);
-        removeKeyFromMemory(key, keyFilePath);
+        try {
+            DbDescriptor descriptor = getDbDescriptor(type);
+            removeKeyFromMemory(key, descriptor.keyFilePath);
+            writeKeyToFile(key, -1, descriptor);
+            updateFilesToRewrite(descriptor.filePath);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
 
-        updateFilesToRewrite(filePath);
     }
 
     /**
@@ -527,16 +638,13 @@ public class KVDataBase {
      * @param object новый объект, значения полей которого заменят старые значения в файле.
      */
     public void update(int key, Object object) {
-        long offset;
+        Class<?> type = object.getClass();
         try {
-            DbDescriptor descriptor = getDbDescriptor(object.getClass());
-            offset = writeFieldsToFile(object, descriptor);
-            writeKeyToMemory(key, offset, descriptor.keyFilePath);
+            DbDescriptor descriptor = getDbDescriptor(type);
+            doUpdate(descriptor, key, object);
             updateFilesToRewrite(descriptor.filePath);
-        } catch (FileNotFoundException | IllegalAccessException e) {
-            e.printStackTrace();
-        } catch (IOException e) {
-            e.printStackTrace();
+        } catch (IllegalAccessException | IOException | InterruptedException e) {
+            throw new RuntimeException(e);
         }
     }
 
@@ -544,14 +652,16 @@ public class KVDataBase {
      * переписывает каждый файл, который был помечен как измененный
      */
     public void rewriteFiles() {
-        for (Map.Entry<Path, Boolean> entry : rewriteStatus.entrySet()) {
-            if (entry.getValue()) {
-                try {
+        lock.writeLock().lock();
+        try {
+            for (Map.Entry<Path, Boolean> entry : rewriteStatus.entrySet()) {
+                if (entry.getValue())
                     rewriteOneFile(entry.getKey());
-                } catch (ClassNotFoundException e) {
-                    e.printStackTrace();
-                }
             }
+        } catch (ClassNotFoundException e) {
+            e.printStackTrace();
+        } finally {
+            lock.writeLock().unlock();
         }
     }
 
@@ -562,21 +672,6 @@ public class KVDataBase {
      * @param filePath
      */
     private void rewriteOneFile(Path filePath) throws ClassNotFoundException {
-//        String fileName = filePath.getFileName().toString();
-//        String tmpFile = mainDirectory + "\\" + fileName.substring(0, fileName.length() - 5) + ".tmp";
-//        Class<?> type = Class.forName(savedTypes.get(fileName.substring(0, fileName.length() - 5)));
-//        Object object;
-//
-//        Path keyFilePath = Paths.get(mainDirectory + "\\" + type.getSimpleName() + "Keys" + extension);
-//        HashMap<Integer, Long> keyOffsetMap = keys.get(keyFilePath);
-//        new File(keyFilePath.toString()).delete();
-//
-//        for (Integer key : keyOffsetMap.keySet()) {
-//            object = get(key, type);
-//            add(key, type.cast(object), tmpFile);
-//        }
-//
-//        new File(filePath.toString()).delete();
-//        new File(tmpFile).renameTo(filePath.toFile());
+        // todo
     }
 }
